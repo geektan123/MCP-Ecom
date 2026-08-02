@@ -121,6 +121,26 @@ npm run test:watch    # Watch mode
 
 Tests run against live PostgreSQL and create their own data at runtime — no hardcoded fixtures or seed data dependencies.
 
+## Live Hosted Deployment
+
+The MCP server is live and hosted on Render:
+
+- **Base URL:** `https://mcp-ecom.onrender.com`
+- **MCP Endpoint:** `https://mcp-ecom.onrender.com/mcp`
+- **Health Check:** `https://mcp-ecom.onrender.com/health`
+
+### Connecting in Cursor (`~/.cursor/mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "stalled-fulfillment-recovery": {
+      "url": "https://mcp-ecom.onrender.com/mcp"
+    }
+  }
+}
+```
+
 ## Deployment
 
 The server listens on `process.env.PORT` (default: 3000). Deploy anywhere that runs Node.js and has PostgreSQL access:
@@ -131,8 +151,8 @@ The server listens on `process.env.PORT` (default: 3000). Deploy anywhere that r
 
 After deploying:
 ```bash
-curl https://<your-url>/health
-npx @modelcontextprotocol/inspector --url https://<your-url>/mcp
+curl https://mcp-ecom.onrender.com/health
+npx @modelcontextprotocol/inspector --url https://mcp-ecom.onrender.com/mcp
 ```
 
 ## Tech Stack
