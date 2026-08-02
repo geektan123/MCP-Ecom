@@ -2,13 +2,39 @@ import pg from 'pg';
 
 const { Pool } = pg;
 
+import fs from 'fs';
+import path from 'path';
+
+if (!process.env.DATABASE_URL) {
+  try {
+    const envPath = path.resolve(process.cwd(), '.env');
+    if (fs.existsSync(envPath)) {
+      const envContent = fs.readFileSync(envPath, 'utf8');
+      const match = envContent.match(/^DATABASE_URL=["']?([^"'\r\n]+)["']?/m);
+      if (match && match[1]) {
+        process.env.DATABASE_URL = match[1];
+      }
+    }
+  } catch {
+    // Ignore error reading .env
+  }
+}
+
 const connectionString =
   process.env.DATABASE_URL ||
   'postgres://localhost:5432/' +
     (process.env.NODE_ENV === 'test' ? 'fulfillment_mcp_test' : 'fulfillment_mcp');
 
+const isRemoteDb = Boolean(
+  process.env.DATABASE_URL &&
+    (process.env.DATABASE_URL.includes('supabase') ||
+      process.env.DATABASE_URL.includes('sslmode=') ||
+      process.env.NODE_ENV === 'production')
+);
+
 export const pool = new Pool({
   connectionString,
+  ...(isRemoteDb ? { ssl: { rejectUnauthorized: false } } : {}),
 });
 
 export async function initDb() {
