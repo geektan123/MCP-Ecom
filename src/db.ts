@@ -42,8 +42,8 @@ export async function initDb() {
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS orders (
-        id VARCHAR(50) PRIMARY KEY,
-        customer_id VARCHAR(50) NOT NULL,
+        id VARCHAR(100) PRIMARY KEY,
+        customer_id VARCHAR(100) NOT NULL,
         status VARCHAR(30) NOT NULL,
         total_amount INTEGER NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
@@ -52,16 +52,16 @@ export async function initDb() {
 
       CREATE TABLE IF NOT EXISTS order_items (
         id SERIAL PRIMARY KEY,
-        order_id VARCHAR(50) REFERENCES orders(id) ON DELETE CASCADE,
-        product_id VARCHAR(50) NOT NULL,
+        order_id VARCHAR(100) REFERENCES orders(id) ON DELETE CASCADE,
+        product_id VARCHAR(100) NOT NULL,
         name VARCHAR(255) NOT NULL,
         quantity INTEGER NOT NULL,
         unit_price INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS fulfillment_tasks (
-        id VARCHAR(50) PRIMARY KEY,
-        order_id VARCHAR(50) UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+        id VARCHAR(100) PRIMARY KEY,
+        order_id VARCHAR(100) UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
         status VARCHAR(30) NOT NULL,
         failure_reason TEXT,
         attempts INTEGER NOT NULL DEFAULT 1,
@@ -74,12 +74,22 @@ export async function initDb() {
       );
 
       CREATE TABLE IF NOT EXISTS audit_log (
-        id VARCHAR(50) PRIMARY KEY,
-        order_id VARCHAR(50) REFERENCES orders(id) ON DELETE CASCADE,
+        id VARCHAR(100) PRIMARY KEY,
+        order_id VARCHAR(100) REFERENCES orders(id) ON DELETE CASCADE,
         action VARCHAR(50) NOT NULL,
         performed_by VARCHAR(100) NOT NULL,
         details TEXT NOT NULL,
         timestamp TIMESTAMPTZ NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS preview_tokens (
+        token VARCHAR(100) PRIMARY KEY,
+        order_id VARCHAR(100) NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        proposed_action VARCHAR(50) NOT NULL,
+        attempts INTEGER NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL
       );
     `);
   } finally {

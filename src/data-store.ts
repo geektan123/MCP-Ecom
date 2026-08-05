@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { pool, initDb } from './db.js';
 import type {
   Order,
@@ -9,6 +10,7 @@ import type {
   StalledOrderEntry,
   StallReason,
 } from './types.js';
+
 // ─── Status derivation ────────────────────────────────────────────────────────
 
 function deriveOrderStatus(fulfillmentStatus: FulfillmentStatus): OrderStatus {
@@ -71,7 +73,7 @@ export async function clearStore(): Promise<void> {
   await initDb();
   const client = await pool.connect();
   try {
-    await client.query('TRUNCATE TABLE audit_log, fulfillment_tasks, order_items, orders CASCADE;');
+    await client.query('TRUNCATE TABLE preview_tokens, audit_log, fulfillment_tasks, order_items, orders CASCADE;');
   } finally {
     client.release();
   }
@@ -202,10 +204,8 @@ export async function addAuditEntry(entry: AuditLogEntry): Promise<void> {
 
 // ─── ID generation ───────────────────────────────────────────────────────────
 
-let seq = Date.now() % 100000;
-
 export function generateId(prefix: string): string {
-  return `${prefix}-${++seq}`;
+  return `${prefix}-${crypto.randomUUID()}`;
 }
 
 export interface CreateOrderInput {
@@ -377,5 +377,254 @@ export async function getStalledOrdersFromDb(thresholdHours: number): Promise<St
     };
   });
 }
+
+// ─── Preview Token Operations ──────────────────────────────────────────────────
+
+export async function createPreviewToken(
+  orderId: string,
+  proposedAction: string,
+  attempts: number
+): Promise<{ token: string; expiresAt: string }> {
+  await initDb();
+  const token = `PRV-${crypto.randomUUID()}`;
+  const now = new Date();
+  const expiresAtDate = new Date(now.getTime() + 10 * 60 * 1000); // 10 minutes TTL
+  const expiresAt = expiresAtDate.toISOString();
+  const createdAt = now.toISOString();
+
+  await pool.query(
+    `INSERT INTO preview_tokens (token, order_id, proposed_action, attempts, expires_at, used, created_at)
+     VALUES ($1, $2, $3, $4, $5, FALSE, $6)`,
+    [token, orderId, proposedAction, attempts, expiresAt, createdAt]
+  );
+
+  return { token, expiresAt };
+}
+
+export async function validateAndConsumePreviewToken(
+  client: any,
+  token: string,
+  orderId: string,
+  proposedAction: string
+): Promise<void> {
+  const res = await client.query(
+    `SELECT * FROM preview_tokens WHERE token = $1 FOR UPDATE`,
+    [token]
+  );
+
+  if (res.rows.length === 0) {
+    throw new Error('PREVIEW_INVALID: The provided preview_token does not exist or is invalid.');
+  }
+
+  const row = res.rows[0];
+  if (row.order_id !== orderId) {
+    throw new Error(`PREVIEW_MISMATCH: preview_token is bound to order ${row.order_id}, not ${orderId}.`);
+  }
+
+  if (row.proposed_action !== proposedAction) {
+    throw new Error(`PREVIEW_MISMATCH: preview_token proposed action (${row.proposed_action}) does not match current action (${proposedAction}).`);
+  }
+
+  if (row.used) {
+    throw new Error('PREVIEW_EXPIRED: The provided preview_token has already been used.');
+  }
+
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    throw new Error('PREVIEW_EXPIRED: The provided preview_token has expired. Please run a dry-run again to obtain a new token.');
+  }
+
+  await client.query(
+    `UPDATE preview_tokens SET used = TRUE WHERE token = $1`,
+    [token]
+  );
+}
+
+// ─── Atomic Fulfillment Retry Transaction ─────────────────────────────────────
+
+export async function executeFulfillmentRetryTransaction(params: {
+  orderId: string;
+  task: FulfillmentTask;
+  auditEntry: AuditLogEntry;
+  previewToken?: string;
+  cooldownMinutes?: number;
+}): Promise<{ order: Order; fulfillment: FulfillmentTask; auditEntry: AuditLogEntry }> {
+  await initDb();
+  const client = await pool.connect();
+  const cooldownMinutes = params.cooldownMinutes ?? 10;
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Pessimistic lock on parent order row to ensure single-threaded execution per order
+    const orderRes = await client.query(
+      `SELECT * FROM orders WHERE id = $1 FOR UPDATE`,
+      [params.orderId]
+    );
+
+    if (orderRes.rows.length === 0) {
+      throw new Error(`NOT_FOUND: Order ${params.orderId} not found.`);
+    }
+
+    const orderRow = orderRes.rows[0];
+    const terminalStatuses = ['shipped', 'delivered', 'cancelled'];
+    if (terminalStatuses.includes(orderRow.status)) {
+      throw new Error(`ORDER_NOT_RETRYABLE: Order ${params.orderId} has status "${orderRow.status}" and cannot be retried.`);
+    }
+
+    // Lock fulfillment row if it exists
+    await client.query(
+      `SELECT * FROM fulfillment_tasks WHERE order_id = $1 FOR UPDATE`,
+      [params.orderId]
+    );
+
+    // 2. Validate and consume preview token if provided
+    if (params.previewToken) {
+      const proposedAction = params.task.attempts === 1 ? 'create_fulfillment_task' : 'reset_fulfillment_to_pending';
+      await validateAndConsumePreviewToken(client, params.previewToken, params.orderId, proposedAction);
+    }
+
+    // 3. Evaluate cooldown inside the transaction under the lock
+    const cooldownRes = await client.query(
+      `SELECT timestamp FROM audit_log
+       WHERE order_id = $1
+         AND action IN ('fulfillment_retry', 'fulfillment_created')
+         AND timestamp > (NOW() - ($2 || ' minutes')::INTERVAL)
+       ORDER BY timestamp DESC
+       LIMIT 1`,
+      [params.orderId, cooldownMinutes]
+    );
+
+    if (cooldownRes.rows.length > 0) {
+      const recentTimestamp = cooldownRes.rows[0].timestamp;
+      const minutesAgo = Math.round((Date.now() - new Date(recentTimestamp).getTime()) / 60000);
+      throw new Error(`DOUBLE_RETRY_PREVENTED: A retry was already performed on order ${params.orderId} ${minutesAgo} minute(s) ago.`);
+    }
+
+    // 4. Upsert fulfillment task
+    await client.query(
+      `INSERT INTO fulfillment_tasks
+       (id, order_id, status, failure_reason, attempts, created_at, updated_at, last_activity_at, shipped_at, delivered_at, tracking_info)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       ON CONFLICT (order_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         failure_reason = EXCLUDED.failure_reason,
+         attempts = EXCLUDED.attempts,
+         updated_at = EXCLUDED.updated_at,
+         last_activity_at = EXCLUDED.last_activity_at,
+         shipped_at = EXCLUDED.shipped_at,
+         delivered_at = EXCLUDED.delivered_at,
+         tracking_info = EXCLUDED.tracking_info`,
+      [
+        params.task.id,
+        params.task.orderId,
+        params.task.status,
+        params.task.failureReason || null,
+        params.task.attempts,
+        params.task.createdAt,
+        params.task.updatedAt,
+        params.task.lastActivityAt,
+        params.task.shippedAt || null,
+        params.task.deliveredAt || null,
+        params.task.trackingInfo || null,
+      ]
+    );
+
+    // 5. Derive and update order status
+    const derivedStatus = deriveOrderStatus(params.task.status);
+    const now = new Date().toISOString();
+    await client.query(
+      `UPDATE orders SET status = $1, updated_at = $2 WHERE id = $3`,
+      [derivedStatus, now, params.orderId]
+    );
+
+    // 6. Insert audit log entry
+    await client.query(
+      `INSERT INTO audit_log (id, order_id, action, performed_by, details, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        params.auditEntry.id,
+        params.auditEntry.orderId,
+        params.auditEntry.action,
+        params.auditEntry.performedBy,
+        params.auditEntry.details,
+        params.auditEntry.timestamp,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    // Fetch updated order items & construct domain object
+    const itemsRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1 ORDER BY id', [params.orderId]);
+    const items: OrderItem[] = itemsRes.rows.map((r) => ({
+      productId: r.product_id,
+      name: r.name,
+      quantity: Number(r.quantity),
+      unitPrice: Number(r.unit_price),
+    }));
+
+    const finalOrderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [params.orderId]);
+    const finalOrder = mapOrder(finalOrderRes.rows[0], items);
+
+    return {
+      order: finalOrder,
+      fulfillment: params.task,
+      auditEntry: params.auditEntry,
+    };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// ─── Escalation Deduplication ────────────────────────────────────────────────
+
+export async function addAuditEntryWithDedup(
+  entry: AuditLogEntry,
+  cooldownMinutes = 30
+): Promise<{ added: boolean; existingEntry?: AuditLogEntry }> {
+  await initDb();
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    if (entry.action === 'escalated') {
+      const existingRes = await client.query(
+        `SELECT * FROM audit_log
+         WHERE order_id = $1
+           AND action = 'escalated'
+           AND timestamp > (NOW() - ($2 || ' minutes')::INTERVAL)
+         ORDER BY timestamp DESC
+         LIMIT 1`,
+        [entry.orderId, cooldownMinutes]
+      );
+
+      if (existingRes.rows.length > 0) {
+        await client.query('COMMIT');
+        return {
+          added: false,
+          existingEntry: mapAuditEntry(existingRes.rows[0]),
+        };
+      }
+    }
+
+    await client.query(
+      `INSERT INTO audit_log (id, order_id, action, performed_by, details, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [entry.id, entry.orderId, entry.action, entry.performedBy, entry.details, entry.timestamp]
+    );
+
+    await client.query('COMMIT');
+    return { added: true };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 
 

@@ -1,10 +1,11 @@
 import { z } from 'zod';
-import { getOrder, addAuditEntry, generateId } from '../data-store.js';
+import { getOrder, addAuditEntryWithDedup, generateId } from '../data-store.js';
 import type { AuditLogEntry } from '../types.js';
 
 export const escalateOrderSchema = {
   order_id: z
     .string()
+    .min(1)
     .describe('The order ID to escalate (e.g. ORD-1042)'),
   reason: z
     .string()
@@ -49,7 +50,27 @@ export async function escalateOrderHandler(
     timestamp: now,
   };
 
-  await addAuditEntry(auditEntry);
+  const { added, existingEntry } = await addAuditEntryWithDedup(auditEntry, 30);
+
+  if (!added && existingEntry) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              escalation_already_recorded: true,
+              order_id,
+              existing_audit_entry: existingEntry,
+              message: `Order ${order_id} was already escalated recently (${existingEntry.timestamp}). Duplicate escalation skipped.`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
 
   return {
     content: [

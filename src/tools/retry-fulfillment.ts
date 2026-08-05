@@ -3,8 +3,8 @@ import {
   getOrder,
   getFulfillmentByOrderId,
   getAuditLog,
-  upsertFulfillment,
-  addAuditEntry,
+  executeFulfillmentRetryTransaction,
+  createPreviewToken,
   generateId,
 } from '../data-store.js';
 import type { FulfillmentTask, AuditLogEntry } from '../types.js';
@@ -12,6 +12,7 @@ import type { FulfillmentTask, AuditLogEntry } from '../types.js';
 export const retryFulfillmentSchema = {
   order_id: z
     .string()
+    .min(1)
     .describe('The order ID to retry fulfillment for (e.g. ORD-1042)'),
   confirm: z
     .boolean()
@@ -20,15 +21,39 @@ export const retryFulfillmentSchema = {
         'Pass true to execute the retry. Always call with confirm=false first ' +
         'and show the result to the operator before confirming.'
     ),
+  preview_token: z
+    .string()
+    .optional()
+    .describe(
+      'Required when confirm=true. The server-generated preview token obtained from a prior confirm=false dry-run.'
+    ),
 };
 
-/** Rate-limit window for double-retry prevention (not idempotency). */
+/** Rate-limit window for double-retry prevention. */
 const RETRY_COOLDOWN_MINUTES = 10;
+
+export function isNonRetryableFailureReason(reason?: string): boolean {
+  if (!reason) return false;
+  const lower = reason.toLowerCase();
+  const ineligibleSubstrings = [
+    'address validation',
+    'postal code',
+    'zip code',
+    'label_generation_failed',
+    'invalid_address',
+    'invalid address',
+    'invalid_customer_data',
+    'malformed_payload',
+    'out_of_stock',
+    'fraud',
+  ];
+  return ineligibleSubstrings.some((sub) => lower.includes(sub));
+}
 
 export async function retryFulfillmentHandler(
   args: z.infer<z.ZodObject<typeof retryFulfillmentSchema>>
 ) {
-  const { order_id, confirm } = args;
+  const { order_id, confirm, preview_token } = args;
 
   // ── 1. Order must exist ───────────────────────────────────────────────────
   const order = await getOrder(order_id);
@@ -72,7 +97,32 @@ export async function retryFulfillmentHandler(
 
   const existingFulfillment = (await getFulfillmentByOrderId(order_id)) ?? null;
 
-  // ── 3. Reject if fulfillment is actively progressing ─────────────────────
+  // ── 3. Check failure reason eligibility (e.g. ORD-1031 postal code failure) ────
+  if (existingFulfillment && isNonRetryableFailureReason(existingFulfillment.failureReason)) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              error: 'not_retryable_data_error',
+              message:
+                `Fulfillment for order ${order_id} failed due to data validation/eligibility error ` +
+                `("${existingFulfillment.failureReason}"). Automated retries cannot resolve input data errors. ` +
+                `Use escalate_order to flag for human review.`,
+              failure_reason: existingFulfillment.failureReason,
+              recommendation: 'escalate_order',
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // ── 4. Reject if fulfillment is actively progressing ─────────────────────
   if (existingFulfillment) {
     const ACTIVE_THRESHOLD_HOURS = 24;
     const activityAgeMs =
@@ -105,45 +155,46 @@ export async function retryFulfillmentHandler(
     }
   }
 
-  // ── 4. Rate-limit: prevent double-retry within cooldown window ────────────
-  const auditEntries = await getAuditLog(order_id);
-  const cooldownMs = RETRY_COOLDOWN_MINUTES * 60 * 1000;
-  const recentRetry = auditEntries.find((e) => {
-    const isRetryAction =
-      e.action === 'fulfillment_retry' || e.action === 'fulfillment_created';
-    const entryAge = Date.now() - new Date(e.timestamp).getTime();
-    return isRetryAction && entryAge < cooldownMs;
-  });
+  // ── 5. Rate-limit check (read-side quick check during preview) ───────────
+  if (!confirm) {
+    const auditEntries = await getAuditLog(order_id);
+    const cooldownMs = RETRY_COOLDOWN_MINUTES * 60 * 1000;
+    const recentRetry = auditEntries.find((e) => {
+      const isRetryAction =
+        e.action === 'fulfillment_retry' || e.action === 'fulfillment_created';
+      const entryAge = Date.now() - new Date(e.timestamp).getTime();
+      return isRetryAction && entryAge < cooldownMs;
+    });
 
-  if (recentRetry) {
-    const minutesAgo = Math.round(
-      (Date.now() - new Date(recentRetry.timestamp).getTime()) / 60000
-    );
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify(
-            {
-              error: 'double_retry_prevented',
-              message:
-                `A retry was already performed on order ${order_id} ${minutesAgo} minute(s) ago. ` +
-                `Wait ${RETRY_COOLDOWN_MINUTES - minutesAgo} more minute(s) before retrying again.`,
-              last_retry_at: recentRetry.timestamp,
-              cooldown_minutes: RETRY_COOLDOWN_MINUTES,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-      isError: true,
-    };
+    if (recentRetry) {
+      const minutesAgo = Math.round(
+        (Date.now() - new Date(recentRetry.timestamp).getTime()) / 60000
+      );
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              {
+                error: 'double_retry_prevented',
+                message:
+                  `A retry was already performed on order ${order_id} ${minutesAgo} minute(s) ago. ` +
+                  `Wait ${RETRY_COOLDOWN_MINUTES - minutesAgo} more minute(s) before retrying again.`,
+                last_retry_at: recentRetry.timestamp,
+                cooldown_minutes: RETRY_COOLDOWN_MINUTES,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 
-  // ── 5. Determine the action ───────────────────────────────────────────────
+  // ── 6. Determine action details ───────────────────────────────────────────
   const now = new Date().toISOString();
-
   const isCreate = existingFulfillment === null;
   const proposedAction = isCreate
     ? 'create_fulfillment_task'
@@ -159,8 +210,10 @@ export async function retryFulfillmentHandler(
 
   const nextAttempts = (existingFulfillment?.attempts ?? 0) + 1;
 
-  // ── 6. Dry run ────────────────────────────────────────────────────────────
+  // ── 7. Dry-run Preview (confirm = false) ──────────────────────────────────
   if (!confirm) {
+    const previewInfo = await createPreviewToken(order_id, proposedAction, nextAttempts);
+
     const dryRunMessage = isCreate
       ? `Will create a new fulfillment task for order ${order_id} in pending status.`
       : `Will reset fulfillment ${existingFulfillment!.id} to pending (attempt #${nextAttempts}). ` +
@@ -176,6 +229,8 @@ export async function retryFulfillmentHandler(
             {
               dry_run: true,
               order_id,
+              preview_token: previewInfo.token,
+              preview_expires_at: previewInfo.expiresAt,
               current_state: currentState,
               proposed_action: proposedAction,
               proposed_result: {
@@ -185,7 +240,7 @@ export async function retryFulfillmentHandler(
               },
               message:
                 dryRunMessage +
-                ' Call again with confirm=true to execute.',
+                ' Pass confirm=true and preview_token to execute.',
             },
             null,
             2
@@ -195,12 +250,32 @@ export async function retryFulfillmentHandler(
     };
   }
 
-  // ── 7. Execute ────────────────────────────────────────────────────────────
+  // ── 8. Execute Retry (confirm = true) ──────────────────────────────────────
+  if (!preview_token) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              error: 'preview_required',
+              message:
+                `Direct confirmation with confirm=true is blocked without a server-verified prior preview. ` +
+                `Call with confirm=false first to obtain a valid preview_token.`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
   let updatedFulfillment: FulfillmentTask;
   let auditAction: AuditLogEntry['action'];
 
   if (isCreate) {
-    // Create a brand-new fulfillment task
     updatedFulfillment = {
       id: generateId('FUL'),
       orderId: order_id,
@@ -212,7 +287,6 @@ export async function retryFulfillmentHandler(
     };
     auditAction = 'fulfillment_created';
   } else {
-    // Reset the existing failed/stalled task
     updatedFulfillment = {
       ...existingFulfillment!,
       status: 'pending',
@@ -223,8 +297,6 @@ export async function retryFulfillmentHandler(
     };
     auditAction = 'fulfillment_retry';
   }
-
-  await upsertFulfillment(updatedFulfillment);
 
   const auditEntry: AuditLogEntry = {
     id: generateId('AUD'),
@@ -240,26 +312,84 @@ export async function retryFulfillmentHandler(
     timestamp: now,
   };
 
-  await addAuditEntry(auditEntry);
+  try {
+    const result = await executeFulfillmentRetryTransaction({
+      orderId: order_id,
+      task: updatedFulfillment,
+      auditEntry,
+      previewToken: preview_token,
+      cooldownMinutes: RETRY_COOLDOWN_MINUTES,
+    });
 
-  const updatedOrder = (await getOrder(order_id))!;
-
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              action_taken: auditAction,
+              order: result.order,
+              fulfillment: result.fulfillment,
+              audit_entry: result.auditEntry,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (err: any) {
+    const msg = err.message || String(err);
+    if (msg.includes('DOUBLE_RETRY_PREVENTED')) {
+      return {
+        content: [
           {
-            success: true,
-            action_taken: auditAction,
-            order: updatedOrder,
-            fulfillment: updatedFulfillment,
-            audit_entry: auditEntry,
+            type: 'text' as const,
+            text: JSON.stringify(
+              { error: 'double_retry_prevented', message: msg },
+              null,
+              2
+            ),
           },
-          null,
-          2
-        ),
-      },
-    ],
-  };
+        ],
+        isError: true,
+      };
+    }
+    if (
+      msg.includes('PREVIEW_INVALID') ||
+      msg.includes('PREVIEW_EXPIRED') ||
+      msg.includes('PREVIEW_MISMATCH')
+    ) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { error: 'preview_invalid', message: msg },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    if (msg.includes('ORDER_NOT_RETRYABLE')) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { error: 'order_not_retryable', message: msg },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    throw err;
+  }
 }
